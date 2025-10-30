@@ -1,55 +1,65 @@
 function F = system_residuals(x, bcs, params, control_input)
-% =========================================================================
-% FUNCTION: system_residuals.m (Final Corrected Version)
-% DATE: 2025-10-29
-% =========================================================================
+% 闭环残差：质量守恒 + 蒸发器出口过热度目标
+% 未知量：x = [p_con ; p_eva] (Pa)
 
-% --- 1. Unpack Guessed Variables ---
-p_con = x(1);
-p_eva = x(2);
+    p_con = x(1);
+    p_eva = x(2);
 
-% --- 2. Sanity Check for Solver Robustness ---
-% 1) p_con > p_eva  2) p_eva > 0.1 bar (~1e4 Pa)  3) p_con < 40 bar (~40e5 Pa)
-if (p_con <= p_eva) || (p_eva <= 1e4) || (p_con > 40e5)
-    F = [1e6; 1e6]; % Return large residuals if pressures are invalid
-    return;
-end
+    % 基本边界检查
+    if (p_con <= p_eva) || (p_eva <= 1e4) || (p_con > 40e5)
+        F = [1e6; 1e6];
+        return;
+    end
 
-% --- 3. Simulate the Refrigeration Cycle Component by Component ---
-try
-    % a) Compressor inlet: saturated vapor at evaporating pressure
-    h_comp_in = get_fluid_props('H', 'P', p_eva, 'Q', 1, 'R134a'); % Q=1
+    fluid = 'R134a';
 
-    % b) COMPRESSOR Model
-    comp_out = model_compressor(control_input, p_eva, p_con, h_comp_in, params);
-    mdot_comp = comp_out.mdot_ref;
-    h_comp_out = comp_out.h_ref_out;
+    % 若未给箱内空气温度，默认等于环境
+    if ~isfield(bcs, 'T_air_chamber') || isempty(bcs.T_air_chamber)
+        bcs.T_air_chamber = bcs.T_amb;
+    end
 
-    % c) CONDENSER Model
-    cond_out = model_heat_exchanger('condenser', mdot_comp, p_con, h_comp_out, bcs.T_amb, params);
-    h_cond_out = cond_out.h_out_ref;
+    try
+        % 1) 压缩机吸气（初值取饱和蒸汽）
+        h_comp_in = get_fluid_props('H','P',p_eva,'Q',1,fluid);
 
-    % d) CAPILLARY TUBE Model
-    cap_out = model_capillary(p_con, h_cond_out, p_eva, params);
-    mdot_cap = cap_out.mdot_ref;
+        % 2) 压缩机
+        comp_out   = model_compressor(control_input, p_eva, p_con, h_comp_in, params);
+        mdot_comp  = comp_out.mdot_ref;
+        h_comp_out = comp_out.h_ref_out;
 
-catch ME
-    warning('A component model failed. Pressure guess (p_con, p_eva): (%.2f, %.2f) bar. Error: %s', ...
-             p_con/1e5, p_eva/1e5, ME.message);
-    F = [1e6; 1e6];
-    return;
-end
+        % 3) 冷凝器
+        cond_out   = model_heat_exchanger('condenser', mdot_comp, p_con, h_comp_out, bcs.T_amb, params);
+        h_cond_out = cond_out.h_out_ref;
 
-% --- 4. Calculate Residuals for the Solver ---
-% RESIDUAL 1: Mass Flow Rate Balance
-F(1) = mdot_comp - mdot_cap;
+        % 4) 毛细管
+        cap_out   = model_capillary(p_con, h_cond_out, p_eva, params);
+        mdot_cap  = cap_out.mdot_ref;
 
-% RESIDUAL 2: Simplified (focus on mass balance)
-F(2) = 0;
+        % 5) 蒸发器（用毛细管出口焓作为入口）
+        eva_out   = model_heat_exchanger('evaporator', mdot_cap, p_eva, cap_out.h_out, bcs.T_air_chamber, params);
+        h_eva_out = eva_out.h_out_ref;
 
-% Normalize the primary residual to improve solver performance
-if abs(mdot_comp) > 1e-6
-    F(1) = F(1) / mdot_comp;
-end
+    catch ME
+        warning('组件模型失败 @ (p_con=%.2fbar, p_eva=%.2fbar): %s', p_con/1e5, p_eva/1e5, ME.message);
+        F = [1e6; 1e6];
+        return;
+    end
 
+    % 残差1：质量守恒
+    F1 = mdot_comp - mdot_cap;
+    if abs(mdot_comp) > 1e-8
+        F1 = F1 / mdot_comp; % 归一化
+    end
+
+    % 残差2：蒸发器出口过热度（目标 superheat_K）
+    try
+        T_sat_eva = get_fluid_props('T','P',p_eva,'Q',1,fluid);
+        T_target  = T_sat_eva + params.evaporator.superheat_K;
+        h_target  = get_fluid_props('H','P',p_eva,'T',T_target,fluid);
+    catch
+        h_target = h_comp_in; % 兜底
+    end
+    F2 = (h_eva_out - h_target) / max(abs(h_target), 1);
+
+    F = [F1; F2];
 end
